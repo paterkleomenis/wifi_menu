@@ -1,4 +1,4 @@
-use std::io;
+use std::{env, io};
 use std::process::Command;
 use std::time::Duration;
 
@@ -40,6 +40,9 @@ struct App {
     networks: Vec<Network>,
     list_state: ListState,
     input_buffer: String,
+    show_password: bool,
+    wifi_interfaces: Vec<String>,
+    current_interface: String,
     
     // For Action Menu
     action_items: Vec<&'static str>,
@@ -52,12 +55,15 @@ struct App {
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(wifi_interfaces: Vec<String>, current_interface: String) -> Self {
         Self {
             mode: AppMode::Scanning,
             networks: Vec::new(),
             list_state: ListState::default(),
             input_buffer: String::new(),
+            show_password: false,
+            wifi_interfaces,
+            current_interface,
             action_items: vec!["Disconnect", "Forget", "Cancel"],
             action_state: ListState::default(),
             target_ssid: String::new(),
@@ -67,6 +73,10 @@ impl App {
     }
 
     fn next_network(&mut self) {
+        if self.networks.is_empty() {
+            self.list_state.select(None);
+            return;
+        }
         let i = match self.list_state.selected() {
             Some(i) => {
                 if i >= self.networks.len() - 1 { 0 } else { i + 1 }
@@ -77,6 +87,10 @@ impl App {
     }
 
     fn previous_network(&mut self) {
+        if self.networks.is_empty() {
+            self.list_state.select(None);
+            return;
+        }
         let i = match self.list_state.selected() {
             Some(i) => {
                 if i == 0 { self.networks.len() - 1 } else { i - 1 }
@@ -101,6 +115,21 @@ impl App {
         };
         self.action_state.select(Some(i));
     }
+
+    fn cycle_interface(&mut self) {
+        if self.wifi_interfaces.is_empty() {
+            return;
+        }
+
+        let current_idx = self
+            .wifi_interfaces
+            .iter()
+            .position(|iface| iface == &self.current_interface)
+            .unwrap_or(0);
+        let next_idx = (current_idx + 1) % self.wifi_interfaces.len();
+        self.current_interface = self.wifi_interfaces[next_idx].clone();
+        self.list_state.select(None);
+    }
 }
 
 // --- Helper Functions ---
@@ -121,9 +150,145 @@ fn run_command(cmd: &str, args: &[&str]) -> Result<String, String> {
     }
 }
 
-fn get_networks() -> Vec<Network> {
+#[derive(Default)]
+struct CliOptions {
+    rescan: bool,
+    disconnect: bool,
+    status: bool,
+    interface: Option<String>,
+}
+
+fn print_usage() {
+    println!("wifi_menu - TUI Wi-Fi manager");
+    println!();
+    println!("Usage:");
+    println!("  wifi_menu [--interface <ifname>]");
+    println!("  wifi_menu --rescan [--interface <ifname>]");
+    println!("  wifi_menu --disconnect [--interface <ifname>]");
+    println!("  wifi_menu --status [--interface <ifname>]");
+    println!("  wifi_menu --help");
+}
+
+fn parse_cli_options() -> Result<CliOptions, String> {
+    let mut opts = CliOptions::default();
+    let mut args = env::args().skip(1);
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--rescan" => opts.rescan = true,
+            "--disconnect" => opts.disconnect = true,
+            "--status" => opts.status = true,
+            "--interface" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--interface requires a value".to_string())?;
+                opts.interface = Some(value);
+            }
+            "--help" | "-h" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            _ => return Err(format!("Unknown argument: {}", arg)),
+        }
+    }
+
+    let action_count = [opts.rescan, opts.disconnect, opts.status]
+        .iter()
+        .filter(|&&flag| flag)
+        .count();
+    if action_count > 1 {
+        return Err("Use only one non-interactive action at a time".to_string());
+    }
+
+    Ok(opts)
+}
+
+fn get_wifi_interfaces() -> Vec<String> {
+    let output = match run_command("nmcli", &["-t", "-f", "DEVICE,TYPE,STATE", "device", "status"]) {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut interfaces = Vec::new();
+    for line in output.lines() {
+        let parts: Vec<&str> = line.split(':').collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        if parts[1] == "wifi" && !parts[0].is_empty() {
+            interfaces.push(parts[0].to_string());
+        }
+    }
+    interfaces
+}
+
+fn pick_default_interface(interfaces: &[String]) -> Option<String> {
+    if interfaces.is_empty() {
+        return None;
+    }
+
+    let output = run_command("nmcli", &["-t", "-f", "DEVICE,TYPE,STATE", "device", "status"]).ok()?;
+    for line in output.lines() {
+        let parts: Vec<&str> = line.split(':').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        if parts[1] == "wifi"
+            && (parts[2].eq_ignore_ascii_case("connected")
+                || parts[2].eq_ignore_ascii_case("connecting"))
+        {
+            return Some(parts[0].to_string());
+        }
+    }
+
+    Some(interfaces[0].clone())
+}
+
+fn run_status(interface: Option<&str>) -> Result<String, String> {
+    let output = run_command("nmcli", &["-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device", "status"])?;
+    let mut rows = Vec::new();
+
+    for line in output.lines() {
+        let parts: Vec<&str> = line.split(':').collect();
+        if parts.len() < 4 || parts[1] != "wifi" {
+            continue;
+        }
+        if let Some(iface) = interface {
+            if parts[0] != iface {
+                continue;
+            }
+        }
+        rows.push(format!(
+            "interface={} state={} connection={}",
+            parts[0], parts[2], parts[3]
+        ));
+    }
+
+    if rows.is_empty() {
+        if let Some(iface) = interface {
+            return Ok(format!("interface={} state=unavailable connection=--", iface));
+        }
+        return Ok("interface=none state=unavailable connection=--".to_string());
+    }
+
+    Ok(rows.join("\n"))
+}
+
+fn get_networks(interface: &str) -> Vec<Network> {
     // Format: IN-USE:SSID:BSSID:SECURITY:SIGNAL
-    let output = match run_command("nmcli", &["-t", "-f", "IN-USE,SSID,BSSID,SECURITY,SIGNAL", "dev", "wifi", "list"]) {
+    let output = match run_command(
+        "nmcli",
+        &[
+            "-t",
+            "-f",
+            "IN-USE,SSID,BSSID,SECURITY,SIGNAL",
+            "dev",
+            "wifi",
+            "list",
+            "ifname",
+            interface,
+        ],
+    ) {
         Ok(o) => o,
         Err(_) => return Vec::new(),
     };
@@ -170,21 +335,25 @@ fn get_networks() -> Vec<Network> {
     networks
 }
 
-fn connect_network(ssid: &str, bssid: &str, password: &str, security: &str) -> Result<String, String> {
+fn connect_network(
+    ssid: &str,
+    bssid: &str,
+    password: &str,
+    security: &str,
+    interface: &str,
+) -> Result<String, String> {
     // Strategy: Use 'dev wifi connect' with BSSID for precision, but name the profile with SSID.
     
     // 1. Delete existing profile to avoid conflicts (e.g. stale key-mgmt settings)
     let _ = run_command("nmcli", &["connection", "delete", ssid]);
 
-    let mut args = vec!["dev", "wifi", "connect"];
-    
+    let mut args = vec!["dev", "wifi", "connect", ssid, "ifname", interface];
     if !bssid.is_empty() {
+        args.push("bssid");
         args.push(bssid);
-        args.push("name");
-        args.push(ssid);
-    } else {
-        args.push(ssid);
     }
+    args.push("name");
+    args.push(ssid);
     
     // Only add password argument if the network is secured
     if security.contains("WPA") || security.contains("RSN") || security.contains("WEP") {
@@ -203,8 +372,12 @@ fn delete_connection(ssid: &str) -> Result<String, String> {
     run_command("nmcli", &["connection", "delete", ssid])
 }
 
-fn disconnect_interface() -> Result<String, String> {
-    run_command("nmcli", &["dev", "disconnect", "wlan0"]) // Assuming wlan0, could detect
+fn disconnect_interface(interface: &str) -> Result<String, String> {
+    run_command("nmcli", &["dev", "disconnect", interface])
+}
+
+fn rescan_interface(interface: &str) -> Result<String, String> {
+    run_command("nmcli", &["dev", "wifi", "rescan", "ifname", interface])
 }
 
 
@@ -247,7 +420,11 @@ fn ui(f: &mut Frame, app: &App) {
     }).collect();
 
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(" Wi-Fi Networks "))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" Wi-Fi Networks ({}) ", app.current_interface)),
+        )
         .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
     f.render_stateful_widget(list, chunks[0], &mut app.list_state.clone());
@@ -261,21 +438,33 @@ fn ui(f: &mut Frame, app: &App) {
     let status_text = match &app.mode {
         AppMode::Processing(msg) => format!(" 󰑐 {} ", msg),
         AppMode::Message(msg) => format!(" 󰋗 {} (Press Any Key)", msg),
-        AppMode::PasswordInput => " Enter Password | Esc to Cancel ".to_string(),
+        AppMode::PasswordInput => " Enter Password | Tab: Show/Hide | Esc: Cancel ".to_string(),
         AppMode::ActionMenu => " Select Action ".to_string(),
         AppMode::Browsing => {
             if let Some(idx) = app.list_state.selected() {
                 let selected_net = &app.networks[idx];
                 if selected_net.ssid.len() > MAX_SSID_DISPLAY_LEN {
-                    format!(" Full SSID: {} | r: Rescan | Enter: Connect | q: Quit ", selected_net.ssid)
+                    format!(
+                        " IF:{} | Full SSID: {} | i: Switch IF | r: Rescan | Enter: Connect | q: Quit ",
+                        app.current_interface, selected_net.ssid
+                    )
                 } else {
-                    " r: Rescan | Enter: Connect | q: Quit ".to_string()
+                    format!(
+                        " IF:{} | i: Switch IF | r: Rescan | Enter: Connect | q: Quit ",
+                        app.current_interface
+                    )
                 }
             } else {
-                " r: Rescan | Enter: Connect | q: Quit ".to_string()
+                format!(
+                    " IF:{} | i: Switch IF | r: Rescan | Enter: Connect | q: Quit ",
+                    app.current_interface
+                )
             }
         }
-        _ => " r: Rescan | Enter: Connect | q: Quit ".to_string(),
+        _ => format!(
+            " IF:{} | i: Switch IF | r: Rescan | Enter: Connect | q: Quit ",
+            app.current_interface
+        ),
     };
     let status_bar = Paragraph::new(status_text).style(status_style);
     f.render_widget(status_bar, chunks[1]);
@@ -284,8 +473,14 @@ fn ui(f: &mut Frame, app: &App) {
     if app.mode == AppMode::PasswordInput {
         let area = centered_rect(60, 20, f.area());
         f.render_widget(Clear, area); // Clear background
-        
-        let input = Paragraph::new(format!("Password: {}\n\n(Press Enter to Connect)", "*".repeat(app.input_buffer.len())))
+
+        let password_display = if app.show_password {
+            app.input_buffer.clone()
+        } else {
+            "*".repeat(app.input_buffer.len())
+        };
+
+        let input = Paragraph::new(format!("Password: {}\n\n(Tab to Show/Hide, Enter to Connect)", password_display))
             .block(Block::default().borders(Borders::ALL).title(format!(" Connect to {} ", app.target_ssid)))
             .style(Style::default().fg(Color::Yellow));
         f.render_widget(input, area);
@@ -328,6 +523,81 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 // --- Main ---
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = match parse_cli_options() {
+        Ok(opts) => opts,
+        Err(e) => {
+            eprintln!("{}", e);
+            print_usage();
+            std::process::exit(2);
+        }
+    };
+
+    let interfaces = get_wifi_interfaces();
+
+    if cli.status {
+        match run_status(cli.interface.as_deref()) {
+            Ok(out) => {
+                println!("{}", out);
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let selected_interface = if let Some(iface) = cli.interface.clone() {
+        if interfaces.iter().any(|candidate| candidate == &iface) {
+            iface
+        } else {
+            eprintln!("Interface '{}' not found among Wi-Fi devices.", iface);
+            std::process::exit(1);
+        }
+    } else {
+        match pick_default_interface(&interfaces) {
+            Some(iface) => iface,
+            None => {
+                eprintln!("No Wi-Fi interface found.");
+                std::process::exit(1);
+            }
+        }
+    };
+
+    if cli.rescan {
+        match rescan_interface(&selected_interface) {
+            Ok(out) => {
+                if !out.is_empty() {
+                    println!("{}", out);
+                } else {
+                    println!("rescan=ok interface={}", selected_interface);
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if cli.disconnect {
+        match disconnect_interface(&selected_interface) {
+            Ok(out) => {
+                if !out.is_empty() {
+                    println!("{}", out);
+                } else {
+                    println!("disconnect=ok interface={}", selected_interface);
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Setup Terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -335,12 +605,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new();
+    let mut app = App::new(interfaces, selected_interface);
     
     // Initial Scan
     app.mode = AppMode::Processing("Scanning...".to_string());
     terminal.draw(|f| ui(f, &app))?;
-    app.networks = get_networks();
+    app.networks = get_networks(&app.current_interface);
     if !app.networks.is_empty() { app.list_state.select(Some(0)); }
     app.mode = AppMode::Browsing;
 
@@ -372,8 +642,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             KeyCode::Char('r') => {
                                 app.mode = AppMode::Processing("Scanning...".to_string());
                                 terminal.draw(|f| ui(f, &app))?;
-                                let _ = run_command("nmcli", &["dev", "wifi", "rescan"]);
-                                app.networks = get_networks();
+                                let _ = rescan_interface(&app.current_interface);
+                                app.networks = get_networks(&app.current_interface);
+                                if !app.networks.is_empty() {
+                                    app.list_state.select(Some(0));
+                                }
+                                app.mode = AppMode::Browsing;
+                            }
+                            KeyCode::Char('i') => {
+                                app.cycle_interface();
+                                app.mode = AppMode::Processing(format!(
+                                    "Switching to {}...",
+                                    app.current_interface
+                                ));
+                                terminal.draw(|f| ui(f, &app))?;
+                                app.networks = get_networks(&app.current_interface);
+                                if !app.networks.is_empty() {
+                                    app.list_state.select(Some(0));
+                                }
                                 app.mode = AppMode::Browsing;
                             }
                             KeyCode::Enter => {
@@ -392,17 +678,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         terminal.draw(|f| ui(f, &app))?;
                                         
                                         // Try passwordless/saved first
-                                        let res = connect_network(&net.ssid, &net.bssid, "", &net.security);
+                                        let res = connect_network(
+                                            &net.ssid,
+                                            &net.bssid,
+                                            "",
+                                            &net.security,
+                                            &app.current_interface,
+                                        );
                                         match res {
                                             Ok(_) => {
                                                 app.mode = AppMode::Message(format!("Connected to {}", net.ssid));
-                                                app.networks = get_networks(); // Refresh status
+                                                app.networks = get_networks(&app.current_interface); // Refresh status
                                             },
                                             Err(_) => {
                                                 // Failed. Need password?
                                                 if !net.security.is_empty() {
                                                     app.mode = AppMode::PasswordInput;
                                                     app.input_buffer.clear();
+                                                    app.show_password = false;
                                                 } else {
                                                     app.mode = AppMode::Message(format!("Failed to connect to {}", net.ssid));
                                                 }
@@ -417,15 +710,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     AppMode::PasswordInput => {
                         match key.code {
                             KeyCode::Esc => app.mode = AppMode::Browsing,
+                            KeyCode::Tab => app.show_password = !app.show_password,
                             KeyCode::Enter => {
                                 app.mode = AppMode::Processing("Verifying Password...".to_string());
                                 terminal.draw(|f| ui(f, &app))?;
                                 
-                                let res = connect_network(&app.target_ssid, &app.target_bssid, &app.input_buffer, &app.target_security);
+                                let res = connect_network(
+                                    &app.target_ssid,
+                                    &app.target_bssid,
+                                    &app.input_buffer,
+                                    &app.target_security,
+                                    &app.current_interface,
+                                );
                                 match res {
                                     Ok(_) => {
                                         app.mode = AppMode::Message("Success!".to_string());
-                                        app.networks = get_networks();
+                                        app.networks = get_networks(&app.current_interface);
                                     },
                                     Err(e) => app.mode = AppMode::Message(format!("Error: {}", e)),
                                 }
@@ -445,14 +745,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let action = app.action_items[idx];
                                     match action {
                                         "Disconnect" => {
-                                            let _ = disconnect_interface();
+                                            let _ = disconnect_interface(&app.current_interface);
                                             app.mode = AppMode::Message("Disconnected".to_string());
-                                            app.networks = get_networks();
+                                            app.networks = get_networks(&app.current_interface);
                                         },
                                         "Forget" => {
                                             let _ = delete_connection(&app.target_ssid);
                                             app.mode = AppMode::Message("Network Forgotten".to_string());
-                                            app.networks = get_networks();
+                                            app.networks = get_networks(&app.current_interface);
                                         },
                                         _ => app.mode = AppMode::Browsing,
                                     }

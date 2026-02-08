@@ -37,5 +37,16 @@ wifi_menu
 
 - **Arrow Keys / j/k:** Navigate
 - **Enter:** Connect / Action Menu
+- **i:** Switch Wi-Fi interface
 - **r:** Rescan
 - **q / Esc:** Quit
+- **Tab (password prompt):** Show/Hide password
+
+### Non-interactive mode
+
+```bash
+wifi_menu --status
+wifi_menu --status --interface wlan0
+wifi_menu --rescan --interface wlan0
+wifi_menu --disconnect --interface wlan0
+```
